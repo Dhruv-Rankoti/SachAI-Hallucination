@@ -50,6 +50,7 @@ export async function analyzeText(source: string, response: string): Promise<Das
 
   const data: BackendResponse = await res.json();
   const { source_sentences, ai_claims, results } = data;
+  console.log(ai_claims)
 
   const claims: Claim[] = results.map((r, i) => ({
     id: `c${i + 1}`,
