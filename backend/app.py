@@ -91,7 +91,7 @@ def build_alignment_matrix(ai_claims, source_sentences):
         })
     return result
 
-def evaluate_response(ai_claims, source_sentences):
+'''def evaluate_response(ai_claims, source_sentences):
     matrix_data = build_alignment_matrix(ai_claims, source_sentences)
     results = []
     for i, claim in enumerate(ai_claims):
@@ -124,7 +124,78 @@ def evaluate_response(ai_claims, source_sentences):
 
         results.append(ev)
     return results
+'''
+def evaluate_response(ai_claims, source_sentences):
+    matrix_data = build_alignment_matrix(ai_claims, source_sentences)
+    results = []
 
+    for i, claim in enumerate(ai_claims):
+        intent = classify_intent(claim)
+        alibi = matrix_data[i]["Matched_Sentence"]
+        s_max = matrix_data[i]["S_Max"]
+        matrix_row = matrix_data[i]["matrix_row"]
+        source_idx = matrix_data[i]["Source_Index"]
+
+        ev = {
+            "claim": claim,
+            "intent": intent,
+            "taxonomy": "TBD",
+            "similarity": s_max,
+            "alibi": alibi,
+            "source_index": source_idx,
+            "matrix_row": matrix_row,
+        }
+
+        # --- FACT HANDLING ---
+        if intent.upper() == "FACT":
+            nli, conf = get_nli_verdict(alibi, claim)
+
+            # --- Forgiving Logic ---
+            if nli == "Entailed":
+                taxonomy = "Verified Fact"
+
+            elif nli == "Contradicted":
+                # Only penalize strong contradictions
+                if conf > 0.75:
+                    taxonomy = "Contradiction"
+                else:
+                    taxonomy = "Possibly Misaligned"
+
+            else:  # Neutral
+                if s_max > 0.75:
+                    taxonomy = "Safe Inference"
+                elif s_max > 0.5:
+                    taxonomy = "Weak Inference"
+                else:
+                    taxonomy = "Likely Hallucination"
+
+            ev.update({
+                "taxonomy": taxonomy,
+                "nli": nli,
+                "confidence": conf
+            })
+
+        # --- OPINION HANDLING ---
+        elif intent.upper() == "OPINION":
+            if s_max > 0.75:
+                ev["taxonomy"] = "Grounded Opinion"
+            elif s_max > 0.5:
+                ev["taxonomy"] = "Loosely Grounded Opinion"
+            else:
+                ev["taxonomy"] = "Ungrounded Opinion"
+
+        # --- SUGGESTION / OTHER ---
+        else:
+            if s_max > 0.7:
+                ev["taxonomy"] = "Relevant Suggestion"
+            elif s_max > 0.4:
+                ev["taxonomy"] = "Weak Suggestion"
+            else:
+                ev["taxonomy"] = "Irrelevant / Hallucinated Suggestion"
+
+        results.append(ev)
+
+    return results
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
