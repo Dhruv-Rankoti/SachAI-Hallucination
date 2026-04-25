@@ -1,14 +1,29 @@
 import os
-import json
 import spacy
 import torch
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from sentence_transformers import SentenceTransformer, util
-from transformers import pipeline
+import time
+import requests
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sentence_transformers import util
+from dotenv import load_dotenv
+load_dotenv()
 
-app = Flask(__name__)
-CORS(app)
+app = FastAPI()
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
+FRONTEND_SECRET = os.environ.get("FRONTEND_SECRET")
+# CORS(app)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[FRONTEND_URL],
+    allow_methods=["POST"],
+    allow_headers=["*"],
+)
+
+class AnalyzeRequest(BaseModel):
+    source: str
+    response: str
 
 # --- Model Init ---
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -17,12 +32,11 @@ nlp_ner = spacy.load("en_core_web_sm")
 MODEL_PATH = "/kaggle/input/notebooks/anirbandasbit/sentenceclassifier/output/model-best"
 nlp_intent = spacy.load(MODEL_PATH) if os.path.exists(MODEL_PATH) else nlp_ner
 
-embedder = SentenceTransformer("all-MiniLM-L6-v2", device=device)
-nli_judge = pipeline(
-    "text-classification",
-    model="cross-encoder/nli-deberta-v3-small",
-    device=0 if device == "cuda" else -1,
-)
+EMBED_URL = "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2/pipeline/feature-extraction"
+NLI_URL = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-mnli/pipeline/zero-shot-classification"
+
+HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_HEADERS = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
 
 # --- Pipeline Functions ---
 def has_verb(tokens):
@@ -57,14 +71,62 @@ def classify_intent(text):
     doc = nlp_intent(text)
     return max(doc.cats, key=doc.cats.get)
 
-def get_nli_verdict(source_sentence, ai_claim):
-    result = nli_judge({"text": source_sentence, "text_pair": ai_claim})
-    label_map = {
-        "contradiction": "Contradicted", "entailment": "Entailed", "neutral": "Neutral",
-        "LABEL_0": "Contradicted", "LABEL_1": "Entailed", "LABEL_2": "Neutral",
+def get_embeddings(sentences: list[str]) -> torch.Tensor:
+    payload = {
+        "inputs": sentences,
+        "options": {"wait_for_model": True}
     }
-    key = result["label"].lower() if result["label"] not in label_map else result["label"]
-    return label_map.get(key, result["label"]), round(result["score"], 4)
+    for attempt in range(3):
+        resp = requests.post(EMBED_URL, headers=HF_HEADERS, json=payload)
+        if resp.status_code != 200 or not resp.text.strip():
+            print(f"[HF Embeddings] Attempt {attempt+1} failed: HTTP {resp.status_code} | {resp.text!r}")
+            time.sleep(2 ** attempt)
+            continue
+        try:
+            data = resp.json()
+            return torch.tensor(data, dtype=torch.float32)
+        except Exception as e:
+            print(f"[HF Embeddings] Parse error: {e} | {resp.text!r}")
+            time.sleep(2 ** attempt)
+    raise RuntimeError("HF Embeddings API failed after 3 attempts.")
+
+def get_nli_verdict(source_sentence: str, ai_claim: str):
+    # bart-large-mnli uses zero-shot-classification pipeline
+    # We classify the CLAIM against the SOURCE as context
+    payload = {
+        "inputs": ai_claim,
+        "parameters": {
+            "candidate_labels": ["entailment", "neutral", "contradiction"],
+            "hypothesis_template": f"Based on '{source_sentence}', this statement is {{}}."
+        },
+        "options": {"wait_for_model": True}
+    }
+
+    for attempt in range(3):
+        resp = requests.post(NLI_URL, headers=HF_HEADERS, json=payload)
+
+        if resp.status_code != 200 or not resp.text.strip():
+            print(f"[HF NLI] Attempt {attempt+1} failed: HTTP {resp.status_code} | {resp.text!r}")
+            time.sleep(2 ** attempt)
+            continue
+
+        try:
+            data = resp.json()
+            # Response: [{'label': 'contradiction', 'score': 0.5283074378967285}, {'label': 'neutral', 'score': 0.31749388575553894}, {'label': 'entailment', 'score': 0.15419872105121613}]
+            label_map = {
+                "contradiction": "Contradicted",
+                "entailment": "Entailed",
+                "neutral": "Neutral"
+            }
+
+            top = data[0]
+            return label_map.get(top["label"].lower(), top["label"]), round(top["score"], 4)
+
+        except Exception as e:
+            print(f"[HF NLI] Parse error: {e} | {resp.text!r}")
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError("HF NLI API failed after 3 attempts.")
 
 def check_numeric_drift(ai_claim_text, top_source_sentence):
     NUMERIC_LABELS = {"MONEY", "PERCENT", "DATE", "TIME", "CARDINAL", "QUANTITY"}
@@ -77,8 +139,10 @@ def check_numeric_drift(ai_claim_text, top_source_sentence):
     return "PASS"
 
 def build_alignment_matrix(ai_claims, source_sentences):
-    claim_emb = embedder.encode(ai_claims, convert_to_tensor=True, device=device)
-    source_emb = embedder.encode(source_sentences, convert_to_tensor=True, device=device)
+    # claim_emb = embedder.encode(ai_claims, convert_to_tensor=True, device=device)
+    # source_emb = embedder.encode(source_sentences, convert_to_tensor=True, device=device)
+    claim_emb = get_embeddings(ai_claims)
+    source_emb = get_embeddings(source_sentences)
     matrix = util.cos_sim(claim_emb, source_emb)
     result = []
     for i in range(len(ai_claims)):
@@ -91,40 +155,6 @@ def build_alignment_matrix(ai_claims, source_sentences):
         })
     return result
 
-'''def evaluate_response(ai_claims, source_sentences):
-    matrix_data = build_alignment_matrix(ai_claims, source_sentences)
-    results = []
-    for i, claim in enumerate(ai_claims):
-        intent = classify_intent(claim)
-        alibi = matrix_data[i]["Matched_Sentence"]
-        s_max = matrix_data[i]["S_Max"]
-        matrix_row = matrix_data[i]["matrix_row"]
-        source_idx = matrix_data[i]["Source_Index"]
-
-        ev = {"claim": claim, "intent": intent, "taxonomy": "TBD", "similarity": s_max,
-              "alibi": alibi, "source_index": source_idx, "matrix_row": matrix_row}
-
-        if intent.upper() == "FACT":
-            drift = check_numeric_drift(claim, alibi)
-            if drift != "PASS":
-                ev.update({"taxonomy": "Numeric Drift", "error": drift})
-            else:
-                nli, conf = get_nli_verdict(alibi, claim)
-                if nli == "Entailed":
-                    taxonomy = "Verified Fact"
-                elif nli == "Contradicted":
-                    taxonomy = "Contradiction"
-                else:
-                    taxonomy = "Extrapolation" if s_max > 0.6 else "Fabrication"
-                ev.update({"taxonomy": taxonomy, "nli": nli, "confidence": conf})
-        elif intent.upper() == "OPINION":
-            ev["taxonomy"] = "Grounded Opinion" if s_max > 0.7 else ("Weakly Grounded Opinion" if s_max > 0.4 else "Ungrounded Opinion")
-        else:
-            ev["taxonomy"] = "Relevant Suggestion" if s_max > 0.6 else "Irrelevant / Hallucinated Suggestion"
-
-        results.append(ev)
-    return results
-'''
 def evaluate_response(ai_claims, source_sentences):
     matrix_data = build_alignment_matrix(ai_claims, source_sentences)
     results = []
@@ -197,28 +227,29 @@ def evaluate_response(ai_claims, source_sentences):
 
     return results
 
-@app.route("/analyze", methods=["POST"])
-def analyze():
-    body = request.get_json()
-    source = body.get("source", "").strip()
-    response = body.get("response", "").strip()
+@app.post("/analyze")
+async def analyze(body: AnalyzeRequest, x_api_key: str = Header(...)):
+    # secret check
+    if x_api_key != FRONTEND_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
+    source = body.source.strip()
+    response = body.response.strip()
     if not source or not response:
-        return jsonify({"error": "Both 'source' and 'response' are required."}), 400
+        raise HTTPException(status_code=400, detail="Both 'source' and 'response' are required.")
 
     source_sentences = extract_claims(source)
     ai_claims = extract_claims(response)
 
     if not source_sentences or not ai_claims:
-        return jsonify({"error": "Could not extract claims from the provided text."}), 422
+        raise HTTPException(status_code=422, detail="Could not extract claims from the provided text.")
 
     results = evaluate_response(ai_claims, source_sentences)
-    return jsonify({
+    return {
         "source_sentences": source_sentences,
         "ai_claims": ai_claims,
         "results": results,
-    })
-
+    }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
