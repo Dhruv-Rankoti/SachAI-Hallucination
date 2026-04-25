@@ -1,7 +1,6 @@
 import type { DashboardData, Claim, ClaimType, SourceSegment } from '@/types/dashboard';
 
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
-const FRONTEND_SECRET = import.meta.env.VITE_FRONTEND_SECRET;
 
 interface BackendResult {
   claim: string;
@@ -41,8 +40,7 @@ export async function analyzeText(source: string, response: string): Promise<Das
   const res = await fetch(`${API_URL}/analyze`, {
     method: 'POST',
     headers: { 
-      'Content-Type': 'application/json',
-      'x-api-key': FRONTEND_SECRET
+      'Content-Type': 'application/json'
     },
     body: JSON.stringify({ source, response }),
   });

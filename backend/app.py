@@ -3,7 +3,7 @@ import spacy
 import torch
 import time
 import requests
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import util
@@ -12,7 +12,6 @@ load_dotenv()
 
 app = FastAPI()
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")
-FRONTEND_SECRET = os.environ.get("FRONTEND_SECRET")
 # CORS(app)
 app.add_middleware(
     CORSMiddleware,
@@ -228,10 +227,11 @@ def evaluate_response(ai_claims, source_sentences):
     return results
 
 @app.post("/analyze")
-async def analyze(body: AnalyzeRequest, x_api_key: str = Header(...)):
-    # secret check
-    if x_api_key != FRONTEND_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
+async def analyze(body: AnalyzeRequest, request: Request):
+    # Check request origin for safety
+    origin = request.headers.get("origin")
+    if origin != FRONTEND_URL:
+        raise HTTPException(status_code=403, detail="Forbidden origin")
 
     source = body.source.strip()
     response = body.response.strip()
